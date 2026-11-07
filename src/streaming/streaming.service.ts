@@ -1,7 +1,10 @@
 import { Injectable, OnModuleInit, OnModuleDestroy, Logger } from '@nestjs/common';
 import { MessagesStreamModes, MessagesStreamFallbackModes } from '@platformatic/kafka';
+import { plainToInstance } from 'class-transformer';
+import { validateSync } from 'class-validator';
 import { consumidor } from './consumidor.js';
 import { TOPICS } from './topics.js';
+import { EventoKafkaDto } from './evento.dto.js';
 
 @Injectable()
 export class StreamingService implements OnModuleInit, OnModuleDestroy {
@@ -30,9 +33,19 @@ export class StreamingService implements OnModuleInit, OnModuleDestroy {
 
   private registrar(mensaje: any) {
     try {
-      const evento = JSON.parse(mensaje.value);
+      const raw = JSON.parse(mensaje.value);
+      const evento = plainToInstance(EventoKafkaDto, raw);
+      const errores = validateSync(evento);
+      
+      if (errores.length > 0) {
+        this.logger.warn(
+          `[${mensaje.topic}] P${mensaje.partition} offset ${mensaje.offset}: Validación fallida - ${errores.map((e: any) => Object.values(e.constraints || {})).join(', ')}`,
+        );
+        return;
+      }
+
       this.logger.log(
-        `[${mensaje.topic}] P${mensaje.partition} offset ${mensaje.offset}: ${evento.tipo || 'sin tipo'} (key=${mensaje.key})`,
+        `[${mensaje.topic}] P${mensaje.partition} offset ${mensaje.offset}: ${evento.tipo} v${evento.version} juegoId=${evento.juegoId} (key=${mensaje.key})`,
       );
     } catch (error) {
       this.logger.warn(
