@@ -1,7 +1,5 @@
 import {
   Consumer,
-  MessagesStreamModes,
-  MessagesStreamFallbackModes,
   stringDeserializers,
 } from '@platformatic/kafka';
 
