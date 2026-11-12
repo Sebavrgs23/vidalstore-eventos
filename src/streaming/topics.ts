@@ -1,20 +1,6 @@
+// Los nombres de los topics en un solo lugar. Los crea vidalstore-plataforma/kafka/topics.sh, nunca el codigo.
 export const TOPICS = {
-  COMPRAS: 'vidalstore.compras',
-  ACTIVIDAD: 'vidalstore.actividad',
-  COMPRAS_DLT: 'vidalstore.compras.dlt',
-  ACTIVIDAD_DLT: 'vidalstore.actividad.dlt',
+  compras: 'vidalstore.compras',
+  actividad: 'vidalstore.actividad',
+  catalogo: 'vidalstore.catalogo',
 } as const;
-
-/**
- * Mapea un topic a su correspondiente Dead Letter Topic.
- */
-export function getDLTTopic(topic: string): string {
-  switch (topic) {
-    case TOPICS.COMPRAS:
-      return TOPICS.COMPRAS_DLT;
-    case TOPICS.ACTIVIDAD:
-      return TOPICS.ACTIVIDAD_DLT;
-    default:
-      return `${topic}.dlt`;
-  }
-}

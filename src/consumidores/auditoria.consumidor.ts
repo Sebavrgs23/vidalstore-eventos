@@ -1,45 +1,76 @@
-import { Injectable, Logger, OnApplicationBootstrap } from '@nestjs/common';
-import type { ConfirmChannel, ConsumeMessage } from 'amqplib';
-import { DatabaseService } from '../database/database.service.js';
-import { MensajeService } from '../mensajeria/mensaje.service.js';
-import { RabbitmqService } from '../mensajeria/rabbitmq.service.js';
+import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
+import { InjectRepository } from '@nestjs/typeorm';
+import type { ConsumeMessage } from 'amqplib';
+import { Repository } from 'typeorm';
 import { QUEUES } from '../mensajeria/topologia.js';
-import { esDelMensaje, detalle } from '../mensajeria/reintentos.js';
+import { conReintentos, detalle, esDelMensaje, MensajeInvalido, payloadDelMensaje, REINTENTOS, sobreDelMensaje, uuidValido } from '../mensajeria/reintentos.js';
+import { MensajeriaService } from '../mensajeria/mensajeria.service.js';
+import { EventoAuditoria } from '../persistencia/evento-auditoria.entity.js';
 
 @Injectable()
-export class AuditoriaConsumidor implements OnApplicationBootstrap {
-  private readonly logger = new Logger(AuditoriaConsumidor.name);
+export class AuditoriaConsumidor implements OnModuleInit {
+  private readonly log = new Logger(AuditoriaConsumidor.name);
 
-  constructor(private readonly database: DatabaseService, private readonly mensajes: MensajeService, private readonly rabbit: RabbitmqService) {}
+  constructor(
+    private readonly mensajeria: MensajeriaService,
+    @InjectRepository(EventoAuditoria)
+    private readonly eventos: Repository<EventoAuditoria>,
+  ) {}
 
-  onApplicationBootstrap(): void { this.rabbit.registrarConsumidor((channel) => this.iniciar(channel)); }
-
-  private iniciar(channel: ConfirmChannel): void {
-    channel.consume(QUEUES.AUDITORIA, (msg) => void this.procesar(channel, msg), { noAck: false });
+  async onModuleInit(): Promise<void> {
+    await this.mensajeria.canal.consume(
+      QUEUES.AUDITORIA,
+      (mensaje) => void this.procesar(mensaje).catch((error) => this.log.error(`canal de auditoria: ${detalle(error)}`)),
+      { noAck: false },
+    );
+    this.log.log(`escuchando la cola ${QUEUES.AUDITORIA}`);
   }
 
-  private async procesar(channel: ConfirmChannel, msg: ConsumeMessage | null): Promise<void> {
-    if (!msg) return;
-    const routingKey = msg.fields.routingKey;
+  private async procesar(mensaje: ConsumeMessage | null): Promise<void> {
+    if (!mensaje) return;
+    const canal = this.mensajeria.canal;
+
     try {
-      const payload = JSON.parse(msg.content.toString());
-      const eventoId = this.mensajes.eventoId(msg);
-      const emitidoEn = this.mensajes.emitidoEn(msg);
-      const usuarioSub = (msg.properties.headers?.['x-usuario-sub'] as string) ?? null;
-      await this.database.query(
-        `INSERT INTO eventos_auditoria (evento_id, routing_key, usuario_sub, payload, emitido_en)
-         VALUES ($1, $2, $3, $4, $5) ON CONFLICT (evento_id) DO NOTHING`,
-        [eventoId, routingKey, usuarioSub, JSON.stringify(payload), emitidoEn],
-      );
-      channel.ack(msg);
-    } catch (error) {
-      this.logger.error(`[AUDITORIA] falla procesando ${routingKey}: ${detalle(error)}`);
-      if (esDelMensaje(error)) {
-        this.logger.error('Error determinista, enviando a DLQ sin reintentos');
-        channel.reject(msg, false);
-      } else {
-        await this.mensajes.reintentar(channel, msg);
+      const payload = payloadDelMensaje(mensaje);
+      const { eventoId, emitidoEn } = sobreDelMensaje(mensaje);
+      const routingKey = mensaje.fields.routingKey;
+      const usuarioSub = mensaje.properties.headers?.['x-usuario-sub'] ?? null;
+      if (usuarioSub !== null && (typeof usuarioSub !== 'string' || !usuarioSub.trim())) {
+        throw new MensajeInvalido('El mensaje no trae un x-usuario-sub valido');
       }
+
+      await conReintentos(
+        async () => {
+          const evento = this.eventos.create({
+            eventoId,
+            routingKey,
+            usuarioSub,
+            payload,
+            emitidoEn: new Date(emitidoEn),
+          });
+          await this.eventos.save(evento);
+        },
+        (intento, error) => this.log.warn(`reintento ${intento}/${REINTENTOS.maximo}: ${detalle(error)}`),
+      );
+
+      canal.ack(mensaje);
+    } catch (error) {
+      if ((error as { code?: string } | null)?.code === '23505') {
+        canal.ack(mensaje);
+        this.log.warn(`reentrega del evento ${this.eventoIdSeguro(mensaje)}: ya estaba guardado, no se duplica`);
+        return;
+      }
+      canal.nack(mensaje, false, false);
+      const ruta = esDelMensaje(error) ? 'mensaje invalido' : `la base no respondio en ${REINTENTOS.maximo} intentos`;
+      this.log.error(`${ruta}, hacia la DLQ: ${detalle(error)}`);
+    }
+  }
+
+  private eventoIdSeguro(msg: ConsumeMessage): string {
+    try {
+      return uuidValido(msg.properties.headers?.['x-evento-id'], 'x-evento-id');
+    } catch {
+      return 'desconocido';
     }
   }
 }
