@@ -29,6 +29,12 @@ export const BINDINGS = {
   CORREOS_PATTERN:   ROUTING_KEYS.CORREO_ENVIAR,
 } as const;
 
+export const DLX_ROUTING_KEYS = {
+  AVISOS:    'vidalstore.avisos.dead',
+  AUDITORIA: 'vidalstore.auditoria.dead',
+  CORREOS:   'vidalstore.correos.dead',
+} as const;
+
 export function argumentosDeCola(routingKeyDlq: string): Options.AssertQueue {
   return {
     durable: true,
@@ -62,12 +68,7 @@ export async function declararTopologia(canal: Channel): Promise<void> {
   }
 
   await canal.bindQueue(QUEUES.AVISOS, EXCHANGES.EVENTOS.nombre, BINDINGS.AVISOS_PATTERN);
+  await canal.bindQueue(QUEUES.AVISOS, EXCHANGES.EVENTOS.nombre, ROUTING_KEYS.COMPRA_REALIZADA);
   await canal.bindQueue(QUEUES.AUDITORIA, EXCHANGES.EVENTOS.nombre, BINDINGS.AUDITORIA_PATTERN);
   await canal.bindQueue(QUEUES.CORREOS, EXCHANGES.COMANDOS.nombre, BINDINGS.CORREOS_PATTERN);
 }
-
-export const DLX_ROUTING_KEYS = {
-  AVISOS:    'vidalstore.avisos.dead',
-  AUDITORIA: 'vidalstore.auditoria.dead',
-  CORREOS:   'vidalstore.correos.dead',
-} as const;

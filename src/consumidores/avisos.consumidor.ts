@@ -1,50 +1,64 @@
-import { Injectable, Logger, OnApplicationBootstrap } from '@nestjs/common';
-import type { ConfirmChannel, ConsumeMessage } from 'amqplib';
-import { DatabaseService } from '../database/database.service.js';
-import { MensajeService } from '../mensajeria/mensaje.service.js';
-import { RabbitmqService } from '../mensajeria/rabbitmq.service.js';
-import { EXCHANGES, QUEUES, ROUTING_KEYS } from '../mensajeria/topologia.js';
-import { esDelMensaje, detalle } from '../mensajeria/reintentos.js';
+import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import type { ConsumeMessage } from 'amqplib';
+import { QUEUES, EXCHANGES, ROUTING_KEYS } from '../mensajeria/topologia.js';
+import { conReintentos, detalle, esCorreoValido, esDelMensaje, MensajeInvalido, payloadDelMensaje, REINTENTOS, sobreDelMensaje } from '../mensajeria/reintentos.js';
+import { MensajeriaService } from '../mensajeria/mensajeria.service.js';
 
 @Injectable()
-export class AvisosConsumidor implements OnApplicationBootstrap {
-  private readonly logger = new Logger(AvisosConsumidor.name);
+export class AvisosConsumidor implements OnModuleInit {
+  private readonly log = new Logger(AvisosConsumidor.name);
 
-  constructor(private readonly database: DatabaseService, private readonly mensajes: MensajeService, private readonly rabbit: RabbitmqService) {}
+  constructor(
+    private readonly mensajeria: MensajeriaService,
+    private readonly config: ConfigService,
+  ) {}
 
-  onApplicationBootstrap(): void { this.rabbit.registrarConsumidor((channel) => this.iniciar(channel)); }
-
-  private iniciar(channel: ConfirmChannel): void {
-    channel.consume(QUEUES.AVISOS, (msg) => void this.procesar(channel, msg), { noAck: false });
+  async onModuleInit(): Promise<void> {
+    await this.mensajeria.canal.consume(
+      QUEUES.AVISOS,
+      (mensaje) => void this.procesar(mensaje).catch((error) => this.log.error(`canal de avisos: ${detalle(error)}`)),
+      { noAck: false },
+    );
+    this.log.log(`escuchando la cola ${QUEUES.AVISOS}`);
   }
 
-  private async procesar(channel: ConfirmChannel, msg: ConsumeMessage | null): Promise<void> {
-    if (!msg) return;
+  private async procesar(mensaje: ConsumeMessage | null): Promise<void> {
+    if (!mensaje) return;
+    const canal = this.mensajeria.canal;
+
     try {
-      const payload = JSON.parse(msg.content.toString());
-      const eventoId = this.mensajes.eventoId(msg);
-      this.mensajes.emitidoEn(msg);
-      const para = this.mensajes.destinatario(payload);
-      const asunto = `Aviso: ${msg.fields.routingKey}`;
-      await this.database.query(
-        `INSERT INTO notificaciones (para, asunto, estado, evento_id)
-         VALUES ($1, $2, 'enviada', $3) ON CONFLICT (evento_id, asunto) DO NOTHING`,
-        [para, asunto, eventoId],
+      const payload = payloadDelMensaje(mensaje);
+      const sobre = sobreDelMensaje(mensaje);
+      const para = this.destinatario(payload);
+      const asunto = `Aviso: ${mensaje.fields.routingKey}`;
+
+      // Una redelivery republica el comando; Correos deduplica por evento origen.
+      await conReintentos(
+        () => this.mensajeria.publicar(EXCHANGES.COMANDOS.nombre, ROUTING_KEYS.CORREO_ENVIAR, {
+          para,
+          asunto,
+          eventoIdOrigen: sobre.eventoId,
+        }, sobre),
+        (intento, error) => this.log.warn(`reintento ${intento}/${REINTENTOS.maximo}: ${detalle(error)}`),
       );
-      channel.publish(EXCHANGES.COMANDOS.nombre, ROUTING_KEYS.CORREO_ENVIAR, Buffer.from(JSON.stringify({ para, asunto, eventoIdOrigen: eventoId })), {
-        persistent: true, contentType: 'application/json',
-        headers: { 'x-evento-id': eventoId, 'x-emitido-en': new Date().toISOString() },
-      });
-      await channel.waitForConfirms();
-      channel.ack(msg);
+
+      canal.ack(mensaje);
     } catch (error) {
-      this.logger.error(`[AVISOS] falla: ${detalle(error)}`);
-      if (esDelMensaje(error)) {
-        this.logger.error('Error determinista, enviando a DLQ sin reintentos');
-        channel.reject(msg, false);
-      } else {
-        await this.mensajes.reintentar(channel, msg);
-      }
+      canal.nack(mensaje, false, false);
+      const ruta = esDelMensaje(error) ? 'mensaje invalido' : `RabbitMQ no confirmo en ${REINTENTOS.maximo} intentos`;
+      this.log.error(`${ruta}, hacia la DLQ: ${detalle(error)}`);
     }
+  }
+
+  private destinatario(payload: Record<string, unknown>): string {
+    const explicito = [payload.para, payload.email, payload.destinatario].find(esCorreoValido);
+    if (explicito !== undefined) return explicito;
+    // Solo un destinatario de laboratorio configurado; nunca inferirlo de sub/JWT.
+    const laboratorio = this.config.get<string>('AVISOS_DESTINATARIO');
+    if (!esCorreoValido(laboratorio)) {
+      throw new MensajeInvalido('No hay destinatario valido ni AVISOS_DESTINATARIO de laboratorio configurado');
+    }
+    return laboratorio;
   }
 }
