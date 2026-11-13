@@ -1,43 +1,64 @@
-import { Injectable, Logger, OnApplicationBootstrap } from '@nestjs/common';
-import type { ConfirmChannel, ConsumeMessage } from 'amqplib';
-import { DatabaseService } from '../database/database.service.js';
-import { RabbitmqService } from '../mensajeria/rabbitmq.service.js';
+import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
+import { InjectRepository } from '@nestjs/typeorm';
+import type { ConsumeMessage } from 'amqplib';
+import { Repository } from 'typeorm';
 import { QUEUES } from '../mensajeria/topologia.js';
+import { MensajeriaService } from '../mensajeria/mensajeria.service.js';
+import { conReintentos, detalle, REINTENTOS } from '../mensajeria/reintentos.js';
+import { MensajeMuerto } from '../persistencia/mensaje-muerto.entity.js';
 
 @Injectable()
-export class CartasMuertasConsumidor implements OnApplicationBootstrap {
-  private readonly logger = new Logger(CartasMuertasConsumidor.name);
+export class CartasMuertasConsumidor implements OnModuleInit {
+  private readonly log = new Logger(CartasMuertasConsumidor.name);
 
-  constructor(private readonly database: DatabaseService, private readonly rabbit: RabbitmqService) {}
+  constructor(
+    private readonly mensajeria: MensajeriaService,
+    @InjectRepository(MensajeMuerto)
+    private readonly mensajesMuertos: Repository<MensajeMuerto>,
+  ) {}
 
-  onApplicationBootstrap(): void { this.rabbit.registrarConsumidor((channel) => this.iniciar(channel)); }
-
-  private iniciar(channel: ConfirmChannel): void {
-    for (const cola of [QUEUES.AVISOS_DLQ, QUEUES.AUDITORIA_DLQ, QUEUES.CORREOS_DLQ]) {
-      channel.consume(cola, (msg) => void this.procesar(channel, cola, msg), { noAck: false });
+  async onModuleInit(): Promise<void> {
+    const colas = [QUEUES.AVISOS_DLQ, QUEUES.AUDITORIA_DLQ, QUEUES.CORREOS_DLQ];
+    for (const cola of colas) {
+      await this.mensajeria.canal.consume(cola, (msg) => {
+        void this.procesar(cola, msg).catch((error) => this.log.error(`canal DLQ: ${detalle(error)}`));
+      }, { noAck: false });
     }
+    this.log.log(`escuchando ${colas.length} colas DLQ`);
   }
 
-  private async procesar(channel: ConfirmChannel, colaDlq: string, msg: ConsumeMessage | null): Promise<void> {
-    if (!msg) return;
+  private async procesar(colaDlq: string, mensaje: ConsumeMessage | null): Promise<void> {
+    if (!mensaje) return;
+    const canal = this.mensajeria.canal;
+
     try {
-      const xDeath = msg.properties.headers?.['x-death'] as Array<Record<string, unknown>> | undefined;
+      const xDeath = mensaje.properties.headers?.['x-death'] as Array<Record<string, unknown>> | undefined;
       const deadLetter = xDeath?.[0];
       const routingKeys = deadLetter?.['routing-keys'] as string[] | undefined;
       const colaOrigen = typeof deadLetter?.queue === 'string' ? deadLetter.queue : colaDlq;
       const intentos = Number(deadLetter?.count ?? 1);
       const motivo = String(deadLetter?.reason ?? 'nack');
-      const routingKey = routingKeys?.[0] ?? msg.fields.routingKey;
-      await this.database.query(
-        `INSERT INTO mensajes_muertos (cola_origen, routing_key, motivo, intentos, payload)
-         VALUES ($1, $2, $3, $4, $5)`,
-        [colaOrigen, routingKey, motivo, intentos, msg.content.toString()],
+      const routingKey = routingKeys?.[0] ?? mensaje.fields.routingKey;
+
+      const registro = this.mensajesMuertos.create({
+        colaOrigen,
+        routingKey,
+        motivo,
+        intentos,
+        payload: mensaje.content.toString(),
+      });
+      await conReintentos(
+        () => this.mensajesMuertos.save(registro),
+        (intento, error) => this.log.warn(`reintento DLQ ${intento}/${REINTENTOS.maximo}: ${detalle(error)}`),
       );
-      this.logger.log(`[DLQ] registrada origen=${colaOrigen} routingKey=${routingKey} motivo=${motivo} intentos=${intentos}`);
-      channel.ack(msg);
+
+      this.log.log(`[DLQ] origen=${colaOrigen} routingKey=${routingKey} motivo=${motivo} intentos=${intentos}`);
+      canal.ack(mensaje);
     } catch (error) {
-      this.logger.error(`[DLQ ${colaDlq}] falla:`, error);
-      setTimeout(() => channel.nack(msg, false, true), 5000);
+      this.log.error(`[DLQ ${colaDlq}] falla:`, error);
+      // Ya es la cola final: conservar el registro si SQL falla. Sin timer que
+      // pueda lanzar un error no manejado sobre un canal cerrado.
+      canal.nack(mensaje, false, true);
     }
   }
 }

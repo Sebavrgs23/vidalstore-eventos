@@ -1,4 +1,6 @@
+// Los nombres de los topics en un solo lugar. Los crea vidalstore-plataforma/kafka/topics.sh, nunca el codigo.
 export const TOPICS = {
-  COMPRAS: 'vidalstore.compras',
-  ACTIVIDAD: 'vidalstore.actividad',
+  compras: 'vidalstore.compras',
+  actividad: 'vidalstore.actividad',
+  catalogo: 'vidalstore.catalogo',
 } as const;

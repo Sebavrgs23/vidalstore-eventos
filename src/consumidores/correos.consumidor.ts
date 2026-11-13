@@ -1,45 +1,82 @@
-import { Injectable, Logger, OnApplicationBootstrap } from '@nestjs/common';
-import type { ConfirmChannel, ConsumeMessage } from 'amqplib';
-import { DatabaseService } from '../database/database.service.js';
-import { MensajeInvalido, MensajeService } from '../mensajeria/mensaje.service.js';
-import { RabbitmqService } from '../mensajeria/rabbitmq.service.js';
+import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
+import { InjectRepository } from '@nestjs/typeorm';
+import type { ConsumeMessage } from 'amqplib';
+import { Repository } from 'typeorm';
 import { QUEUES } from '../mensajeria/topologia.js';
-import { esDelMensaje, detalle } from '../mensajeria/reintentos.js';
+import { conReintentos, detalle, esCorreoValido, esDelMensaje, MensajeInvalido, payloadDelMensaje, REINTENTOS, sobreDelMensaje, uuidValido } from '../mensajeria/reintentos.js';
+import { MensajeriaService } from '../mensajeria/mensajeria.service.js';
+import { Notificacion } from '../persistencia/notificacion.entity.js';
 
 @Injectable()
-export class CorreosConsumidor implements OnApplicationBootstrap {
-  private readonly logger = new Logger(CorreosConsumidor.name);
+export class CorreosConsumidor implements OnModuleInit {
+  private readonly log = new Logger(CorreosConsumidor.name);
 
-  constructor(private readonly database: DatabaseService, private readonly mensajes: MensajeService, private readonly rabbit: RabbitmqService) {}
+  constructor(
+    private readonly mensajeria: MensajeriaService,
+    @InjectRepository(Notificacion)
+    private readonly notificaciones: Repository<Notificacion>,
+  ) {}
 
-  onApplicationBootstrap(): void { this.rabbit.registrarConsumidor((channel) => this.iniciar(channel)); }
-
-  private iniciar(channel: ConfirmChannel): void {
-    channel.consume(QUEUES.CORREOS, (msg) => void this.procesar(channel, msg), { noAck: false });
+  async onModuleInit(): Promise<void> {
+    await this.mensajeria.canal.consume(
+      QUEUES.CORREOS,
+      (mensaje) => void this.procesar(mensaje).catch((error) => this.log.error(`canal de correos: ${detalle(error)}`)),
+      { noAck: false },
+    );
+    this.log.log(`escuchando la cola ${QUEUES.CORREOS}`);
   }
 
-  private async procesar(channel: ConfirmChannel, msg: ConsumeMessage | null): Promise<void> {
-    if (!msg) return;
+  private async procesar(mensaje: ConsumeMessage | null): Promise<void> {
+    if (!mensaje) return;
+    const canal = this.mensajeria.canal;
+
     try {
-      const payload = JSON.parse(msg.content.toString()) as Record<string, unknown>;
-      const eventoId = this.mensajes.eventoId(msg);
-      this.mensajes.emitidoEn(msg);
-      const para = this.mensajes.destinatario(payload);
-      if (typeof payload.asunto !== 'string' || payload.asunto.length === 0) throw new MensajeInvalido('El comando no trae asunto');
-      await this.database.query(
-        `INSERT INTO notificaciones (para, asunto, estado, evento_id)
-         VALUES ($1, $2, 'enviada', $3) ON CONFLICT (evento_id, asunto) DO NOTHING`,
-        [para, payload.asunto, eventoId],
-      );
-      channel.ack(msg);
-    } catch (error) {
-      this.logger.error(`[CORREOS] falla: ${detalle(error)}`);
-      if (esDelMensaje(error)) {
-        this.logger.error('Error determinista, enviando a DLQ sin reintentos');
-        channel.reject(msg, false);
-      } else {
-        await this.mensajes.reintentar(channel, msg);
+      const payload = payloadDelMensaje(mensaje);
+      const sobre = sobreDelMensaje(mensaje);
+      const eventoId = uuidValido(payload.eventoIdOrigen, 'eventoIdOrigen');
+      if (eventoId.toLowerCase() !== sobre.eventoId.toLowerCase()) {
+        throw new MensajeInvalido('eventoIdOrigen no coincide con x-evento-id');
       }
+      const para = this.destinatario(payload);
+      if (typeof payload.asunto !== 'string' || !payload.asunto.trim()) throw new MensajeInvalido('El comando no trae asunto');
+
+      // «enviada» representa correo simulado; la unicidad por eventoId evita duplicar redeliveries.
+      await conReintentos(
+        async () => {
+          const notificacion = this.notificaciones.create({
+            para,
+            asunto: payload.asunto as string,
+            estado: 'enviada',
+            eventoId,
+          });
+          await this.notificaciones.save(notificacion);
+        },
+        (intento, error) => this.log.warn(`reintento ${intento}/${REINTENTOS.maximo}: ${detalle(error)}`),
+      );
+
+      canal.ack(mensaje);
+    } catch (error) {
+      if ((error as { code?: string } | null)?.code === '23505') {
+        canal.ack(mensaje);
+        this.log.warn(`reentrega del evento ${this.eventoIdSeguro(mensaje)}: ya estaba guardado, no se duplica`);
+        return;
+      }
+      canal.nack(mensaje, false, false);
+      const ruta = esDelMensaje(error) ? 'mensaje invalido' : `la base no respondio en ${REINTENTOS.maximo} intentos`;
+      this.log.error(`${ruta}, hacia la DLQ: ${detalle(error)}`);
     }
+  }
+
+  private eventoIdSeguro(msg: ConsumeMessage): string {
+    try {
+      return uuidValido(msg.properties.headers?.['x-evento-id'], 'x-evento-id');
+    } catch {
+      return 'desconocido';
+    }
+  }
+
+  private destinatario(payload: Record<string, unknown>): string {
+    if (!esCorreoValido(payload.para)) throw new MensajeInvalido('El comando no tiene un destinatario valido');
+    return payload.para;
   }
 }

@@ -1,0 +1,9 @@
+import { Controller, Get } from '@nestjs/common';
+
+@Controller('salud')
+export class SaludController {
+  @Get()
+  salud() {
+    return { estado: 'ok', servicio: 'vidalstore-eventos' };
+  }
+}
